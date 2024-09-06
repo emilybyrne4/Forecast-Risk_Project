@@ -1,0 +1,410 @@
+---
+title: "Forecast Project"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Project Setup
+
+-   Install and Load Packages
+
+```{r}
+
+library(tidyverse)
+library(lubridate)
+library(tsibble)
+library(feasts)
+library(dplyr)
+library(fpp3)
+```
+
+-   Import Dataset
+
+```{r}
+Oil <- read.csv("BrentOilPrices.csv")
+
+```
+
+
+## Data Wrangling
+
+-   Aggregate time series to desired format for forecasting
+
+```{r}
+
+#Convert Date (chr) to (Date)
+Oil$Date <- as.Date(Oil$Date, format = "%d-%b-%y")
+
+```
+
+-   Deal with missing data
+
+```{r}
+#No Missing Data but there is missing data between days
+sum(is.na(Oil))
+tail(Oil)
+
+#fill gaps in Dates
+Oil <- Oil %>%
+  complete(Date = seq.Date(min(Date), max(Date), by="day")) %>%
+  fill("Price")
+
+Oil
+```
+
+-   Convert to tsibble
+
+```{r}
+
+Oil <- Oil %>%
+  as_tsibble(index = Date)
+
+Oil
+```
+
+-   Create new variables to aid in forecasting
+
+```{r}
+
+#Year Extraction
+Oil <- Oil %>%
+  mutate(Year = year(Date))
+
+#Quarter
+Oil <- Oil %>%
+  mutate(Quarter = quarter(Date))
+
+#Month
+Oil <- Oil %>%
+  mutate(Month = month(Date))
+
+#Day of the week
+Oil <- Oil %>%
+  mutate(Weekday = wday(Date))
+
+```
+
+## Exploratory analysis and visualization for the dataset
+
+```{r}
+Oil %>% autoplot(Price)
+```
+
+```{r}
+Oil %>% gg_season(Price, period = "year")
+```
+
+```{r}
+Oil %>% gg_subseries(Price, period = "month")
+Oil %>% gg_subseries(Price, period = "weekday")
+Oil %>% gg_lag(Price, period = "weekday")
+Oil %>% ACF(Price)
+```
+
+```{r}
+
+ggplot(Oil)+
+  geom_bar(aes(x=Month, y=Price, fill= Weekday), stat = "identity")
+
+ggplot(Oil)+
+  geom_bar(aes(x=Quarter, y=Price, fill= Month), stat = "identity")
+
+ggplot(Oil)+
+  geom_bar(aes(x=Weekday, y=Price, fill= Year), stat = "identity")
+```
+
+## Model fitting
+
+- Split dataset into training and test sets 
+
+```{r}
+
+  #training/test split
+  #15%-85% Split.
+
+train <- Oil %>% filter(Date < '2015-03-28')
+test <- Oil %>% filter(Date >= '2015-03-28')
+```
+
+- Fit Benchmark Models/Fit TSLM Model
+  LM Fitting
+
+```{r}
+
+#train a few linear models and benchmark models
+lm <- train %>% 
+  model(
+    lm = TSLM(Price ~ trend())
+    )
+
+glance(lm)
+
+
+aug_lm <- augment(lm)
+aug_lm
+
+
+aug_lm %>% 
+  ggplot(aes(x=Date)) +
+  geom_line(aes(y = Price, color = "Data")) +
+  geom_line(aes(y = .fitted, color = "Fitted")) +
+  scale_color_manual(values = c(Data = "Black", Fitted = "Blue"))
+
+lm %>% gg_tsresiduals()
+
+aug_lm %>% features(.innov, unitroot_kpss)
+#Not Stationary
+
+train %>% features(Price, unitroot_kpss)
+#Original Dat Not Stationary
+
+
+#difference to convert to stationary, feature engineering (lags)
+Oil_n <- Oil %>% 
+  select(c(Price)) %>% 
+  mutate(Diff_Price = difference(Price),
+         P_lag1 = lag(Diff_Price, 1),
+         P_lag2 = lag(Diff_Price, 2),
+         P_lag3 = lag(Diff_Price, 3),
+         P_lag4 = lag(Diff_Price, 4)) %>% 
+  filter(!is.na(P_lag4))
+
+Oil_n %>% autoplot(Diff_Price)
+
+#high pvalue of kpss implies stationary
+Oil_n %>% features(Diff_Price, unitroot_kpss)
+
+train_lm <- Oil_n %>% filter(Date < '2015-03-28')
+test_lm <- Oil_n %>% filter(Date >= '2015-03-28')
+
+#train a few linear models and benchmark models
+models <- train_lm %>% 
+  model(
+    lm_t_lag = TSLM(Diff_Price ~ trend() + P_lag1 + P_lag2 + P_lag3 + P_lag4),
+    lm_lag = TSLM(Diff_Price ~ P_lag1 + P_lag2 + P_lag3 + P_lag4),
+    mean = MEAN(Diff_Price),
+    naive = NAIVE(Diff_Price),
+    drift = RW(Diff_Price ~ drift()),
+    lm = TSLM(Diff_Price ~ trend())
+  )
+
+glance(models)
+
+TSLM <- train_lm %>%
+  model(
+    lm = TSLM(Diff_Price ~ trend())
+  )
+  
+
+#view the regression summary
+report(TSLM)
+
+#inspect residuals
+aug_TSLM <- augment(TSLM)
+
+aug_TSLM %>% 
+  ggplot(aes(x=Date)) +
+  geom_line(aes(y = Diff_Price, color = "Data")) +
+  geom_line(aes(y = .fitted, color = "Fitted")) +
+  scale_color_manual(values = c(Data = "Black", Fitted = "Blue"))
+
+#first step is to use gg_tsresiduals to assess residual autocorrelation, distribution and changing properties
+TSLM %>% gg_tsresiduals()
+
+aug_TSLM %>% features(.innov, unitroot_kpss)
+
+
+#plot residuals against predictors to ensure we modeled correctly
+train_lm %>% 
+  left_join(residuals(TSLM), by = "Date") %>% 
+  pivot_longer(c(P_lag1:P_lag4),
+               names_to = "regressor", values_to = "x") %>% 
+  ggplot(aes(x = x, y = .resid)) +
+  geom_point() +
+  facet_wrap(. ~ regressor, scales = "free_x") +
+  labs(y = "Residuals", x = "")
+
+#fitted values vs residuals looks like noise
+aug_TSLM %>% 
+  ggplot(aes(x = .fitted, y = .innov)) +
+  geom_point() + labs(x = "Fitted", y = "Residuals")
+
+#After Differencing Data Model AICc went from 59506.01 to -2603.548
+#TSLM Is best model in Family
+glance(lm)
+glance(TSLM)
+```
+
+- Fit ETS Model/Comparing Model performance using accuracy measures  
+  ETS Fitting
+
+```{r}
+#Fitting ETS Models
+
+#fitting models
+fit_ETS <- Oil %>% 
+  model(SES = ETS(Price ~ error("A") + trend("N") + season("N")),
+        Holt = ETS(Price ~ error("A") + trend("A") + season("N")),
+        Damped = ETS(Price ~ error("A") + trend("Ad") + season("N")))
+
+#review fitted models (AICc)
+glance(fit_ETS)
+
+
+#training/test split
+#15%-85% Split.
+
+train_ETS <- Oil %>% filter(Date < '2015-03-28')
+test_ETS <- Oil %>% filter(Date >= '2015-03-28')
+
+#use AICc to find me a model and also check out some other models
+models <- train_ETS %>% 
+  model(
+    AAA = ETS(Price ~ error("A") + trend("A") + season("A")),
+    AAM = ETS(Price ~ error("A") + trend("A") + season("M")),
+    MAA = ETS(Price ~ error("M") + trend("A") + season("A")))
+
+glance(models)
+
+#MMA model performs best 
+MAA <- train_ETS %>% 
+  model(AAM = ETS(Price ~ error("A") + trend("A") + season("M")))
+
+report(MAA)
+
+MAA %>% gg_tsresiduals()
+
+```
+
+- Prophet Model
+
+```{r}
+#install.packages("fable.prophet")
+library(fable.prophet)
+
+fit <- train %>% 
+  model(prophet(Oil),
+        ARIMA(Oil),
+        ETS(Oil))
+
+fc <- fit %>% forecast(h = "3 years")
+fc %>% accuracy(test)
+
+fit_prophet <- train %>% 
+  model(prophet(Oil))
+
+fit_prophet %>% components() %>% autoplot()
+```
+
+- ARIMA Fitting
+
+```{r}
+
+#is this data stationary?
+Oil %>% ACF(Price) %>% autoplot()
+Oil %>% features(Price, unitroot_kpss) #low p-value implies non-stationary
+
+#Data is not stationary
+
+Oil %>% features(Price, unitroot_nsdiffs) # 2 differences suggested
+#but dataset is not long enough for 2 seasonal differences
+
+Oil %>% features(Price, list(unitroot_nsdiffs, feat_stl))
+
+Oil %>% features(difference(Price,52), unitroot_kpss) #nope
+#we will take 1 difference on seasonal based on length of dataset
+
+s_diff_Oil <- Oil %>% mutate(s_diff_price = difference(Price, 52),
+                                ns_s_diff_price = difference(s_diff_price))
+
+#now data is stationary based on kpss test
+s_diff_Oil %>% autoplot(ns_s_diff_price)
+s_diff_Oil %>% ACF(ns_s_diff_price) %>% autoplot()
+s_diff_Oil %>% features(ns_s_diff_price, unitroot_kpss)
+
+
+train_arima <- s_diff_Oil %>% filter(Date < '2015-03-28')
+test_arima <- s_diff_Oil %>% filter(Date >= '2015-03-28')
+
+#try out a few ARIMA models and check for AICc
+arima <- train_arima %>% 
+  model(AR1 = ARIMA(Price ~ pdq(3,1,0) + PDQ(0,1,0)),
+        AR2 = ARIMA(Price ~ pdq(4,1,0) + PDQ(0,1,0)),
+        automatic = ARIMA(Price), #fable algorithm
+        automatic_exhaustive = ARIMA(Price, stepwise = FALSE), #exhaustive search
+        automatic_no_seas_exhaustive = ARIMA(Price ~ PDQ(0, 0, 0), stepwise = FALSE), 
+        #exhaustive search no seasonal differences
+        automatic_no_seas = ARIMA(Price ~ PDQ(0,0,0)), #fable algorithm no seasonal differencing
+        MA = ARIMA(Price ~ pdq(p = 0, d = 1, q = 0:4))) #MA model
+
+#compare aicc
+glance(arima)
+
+#review what models were developed
+models <- arima 
+View(arima)
+
+#compare accuracy on best performing models
+MA <- train_arima %>% 
+  model(MA = ARIMA(Price ~ pdq(p = 0, d = 1, q = 0:4)))
+
+glance(MA)
+
+MA %>% gg_tsresiduals()
+```
+    
+## Accuracy Measures:
+
+```{r}
+
+#Linear TSLM Best Model Performance against Test Data.
+
+fc_TSLM <- TSLM %>% 
+  forecast(new_data = test_lm)
+
+fc_TSLM %>% autoplot(test_lm, level = NULL)
+
+fc_TSLM %>% accuracy(Oil_n) # test accuracy
+
+glance(TSLM)
+
+#ETS MA Best Model Performance against Test Data.
+
+
+fc_MAA <- MAA %>%
+  forecast(new_data = test_ETS)
+
+fc_MAA %>% autoplot(test_ETS, level = NULL)
+
+fc_MAA %>% accuracy(Oil)
+
+glance(MAA)
+
+
+#ARIMA 
+
+fc_MA <- MA %>%
+  forecast(new_data = test_arima)
+
+fc_MA %>% autoplot(test_arima, level = NULL)
+
+fc_MA %>% accuracy(s_diff_Oil)
+
+glance(MA)
+
+
+
+#Selecting TSLM Model
+
+
+```
+
+```{r}
+
+fc_MA <- MA %>% forecast(h = 400)
+fc_MA %>% autoplot(Oil_n)
+```
